@@ -15,6 +15,10 @@
   <!-- Babel Standalone -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
+  <!-- Firebase Realtime Database -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+
   <style>
     .custom-scrollbar::-webkit-scrollbar {
       width: 8px;
@@ -46,6 +50,36 @@
     const { useState, useEffect, useRef, useMemo } = React;
 
     const apiKey = ""; // Canvas runtime automatically supplies the API Key
+
+    // FIREBASE PROJECT 2 — WINNERS KLASEMEN VERSI 2
+    const FIREBASE_DATABASE_URL = "https://winners-klasemen-versi-2-default-rtdb.asia-southeast1.firebasedatabase.app";
+
+    let firebaseDb = null;
+    let firebaseEnabled = false;
+
+    function connectFirebase() {
+      return new Promise((resolve) => {
+        try {
+          if (!window.firebase) throw new Error("Firebase SDK belum termuat");
+
+          if (!firebase.apps.length) {
+            firebase.initializeApp({ databaseURL: FIREBASE_DATABASE_URL });
+          }
+
+          firebaseDb = firebase.database();
+          firebaseDb.goOnline();
+          firebaseEnabled = true;
+          console.log("Firebase Project 2 terhubung:", FIREBASE_DATABASE_URL);
+          resolve(true);
+        } catch (err) {
+          console.error("Firebase gagal diinisialisasi:", err);
+          firebaseEnabled = false;
+          resolve(false);
+        }
+      });
+    }
+
+    const firebaseConnectionPromise = connectFirebase();
 
     async function fetchWithBackoff(url, options, retries = 3, delay = 1000) {
       try {
@@ -214,6 +248,11 @@
       const [newPinInput, setNewPinInput] = useState('');
 
       const [isAiModalOpen, setIsAiModalOpen] = useState(false);
+      const [firebaseStatus, setFirebaseStatus] = useState('connecting');
+      const [firebaseReady, setFirebaseReady] = useState(false);
+      const remoteLoadedRef = useRef(false);
+      const lastRemoteJsonRef = useRef('');
+      const saveTimerRef = useRef(null);
       const [aiActiveTab, setAiActiveTab] = useState('news');
       const [aiNewsText, setAiNewsText] = useState('');
       const [isGeneratingNews, setIsGeneratingNews] = useState(false);
@@ -255,6 +294,11 @@
         setTimeout(() => setToastMsg(null), 3000);
       };
 
+      // Menyimpan referensi data terbaru agar listener realtime tidak mengganggu
+      // input admin saat mengetik. Snapshot yang berasal dari penulisan lokal
+      // diabaikan sehingga skor/nama pemain tidak "ter-reset" setiap beberapa karakter.
+      const lastLocalWriteJsonRef = useRef('');
+
       useEffect(() => {
         localStorage.setItem('soccer_tournament_name', tournamentName);
         localStorage.setItem('soccer_clubs', JSON.stringify(clubs));
@@ -263,8 +307,135 @@
         localStorage.setItem('soccer_knockout', JSON.stringify(knockout));
         localStorage.setItem('soccer_public_access', String(publicAccess));
         if (adminPin) localStorage.setItem('soccer_admin_pin', adminPin);
+      }, [tournamentName, clubs, matches, topScorers, knockout, publicAccess, adminPin]);
 
-      }, [tournamentName, clubs, matches, topScorers, knockout, publicAccess, adminPin, isAdmin]);
+      // Kirim perubahan ke Firebase dengan debounce singkat.
+      useEffect(() => {
+        if (!firebaseReady || !firebaseEnabled || !firebaseDb || !remoteLoadedRef.current) return;
+
+        const payload = { tournamentName, clubs, matches, topScorers, knockout, publicAccess };
+        payload.adminPin = adminPin || null;
+
+        const json = JSON.stringify(payload);
+        if (json === lastRemoteJsonRef.current) return;
+
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = setTimeout(() => {
+          firebaseDb.ref('tournament').update(payload)
+            .then(() => {
+              lastRemoteJsonRef.current = json;
+              lastLocalWriteJsonRef.current = json;
+              setFirebaseStatus('online');
+            })
+            .catch(err => {
+              console.error('Firebase save gagal:', err);
+              setFirebaseStatus('error');
+              showToast('⚠️ Gagal menyimpan ke Firebase.');
+            });
+        }, 120);
+
+        return () => clearTimeout(saveTimerRef.current);
+      }, [tournamentName, clubs, matches, topScorers, knockout, publicAccess, adminPin, firebaseReady]);
+
+      // Listener realtime: satu listener untuk seluruh data turnamen.
+      useEffect(() => {
+        let alive = true;
+        let ref = null;
+
+        firebaseConnectionPromise
+          .then((ok) => {
+            if (!alive) return;
+            if (!ok || !firebaseDb) {
+              setFirebaseStatus('error');
+              remoteLoadedRef.current = true;
+              return;
+            }
+
+            setFirebaseReady(true);
+            ref = firebaseDb.ref('tournament');
+
+            const handleValue = (snapshot) => {
+              if (!alive) return;
+              const data = snapshot.val();
+
+              // Database baru masih kosong: isi dengan data lokal yang sudah ada.
+              if (!data) {
+                remoteLoadedRef.current = true;
+                setFirebaseStatus('online');
+                const seedPayload = { tournamentName, clubs, matches, topScorers, knockout, publicAccess };
+                seedPayload.adminPin = adminPin || null;
+                const seedJson = JSON.stringify(seedPayload);
+                lastRemoteJsonRef.current = seedJson;
+                lastLocalWriteJsonRef.current = seedJson;
+                ref.update(seedPayload).catch(error => {
+                  console.error('Firebase seed gagal:', error);
+                  setFirebaseStatus('error');
+                });
+                return;
+              }
+
+              const payload = {
+                tournamentName: data.tournamentName ?? tournamentName,
+                clubs: data.clubs ?? clubs,
+                matches: data.matches ?? matches,
+                topScorers: data.topScorers ?? topScorers,
+                knockout: data.knockout ?? knockout,
+                publicAccess: data.publicAccess ?? true,
+                adminPin: data.adminPin ?? null
+              };
+
+              if (typeof data.adminPin === 'string' && data.adminPin.trim() !== '') {
+                setAdminPin(data.adminPin);
+                localStorage.setItem('soccer_admin_pin', data.adminPin);
+              }
+
+              const json = JSON.stringify(payload);
+              // Abaikan echo dari write perangkat ini sendiri.
+              if (json === lastLocalWriteJsonRef.current) {
+                remoteLoadedRef.current = true;
+                lastRemoteJsonRef.current = json;
+                setFirebaseStatus('online');
+                return;
+              }
+
+              lastRemoteJsonRef.current = json;
+              remoteLoadedRef.current = true;
+
+              setTournamentName(payload.tournamentName);
+              setClubs(payload.clubs);
+              setMatches(payload.matches);
+              setTopScorers(payload.topScorers);
+              setKnockout(payload.knockout);
+              setPublicAccess(payload.publicAccess);
+              localStorage.setItem('soccer_public_access', String(payload.publicAccess));
+              setFirebaseStatus('online');
+            };
+
+            const handleError = (error) => {
+              console.error('Firebase listener error:', error);
+              setFirebaseStatus('error');
+              remoteLoadedRef.current = true;
+            };
+
+            ref.on('value', handleValue, handleError);
+
+            return () => {
+              ref.off('value', handleValue);
+            };
+          })
+          .catch((error) => {
+            console.error('Firebase connection error:', error);
+            if (alive) {
+              setFirebaseStatus('error');
+              remoteLoadedRef.current = true;
+            }
+          });
+
+        return () => {
+          alive = false;
+          if (ref) ref.off();
+        };
+      }, []);
 
       const handleLoginAdmin = () => {
         if (!adminPin) {
@@ -598,7 +769,6 @@
           setAdminPin(nextPin);
           localStorage.setItem('soccer_admin_pin', nextPin);
         } else if (adminPin) {
-          remotePinExistsRef.current = true;
         }
         setIsSettingsOpen(false);
         showToast("⚙️ Pengaturan turnamen & susunan tim berhasil disimpan!");
@@ -611,7 +781,6 @@
           setMatches(initialMatches);
           setKnockout(initialKnockout);
           setAdminPin('');
-          remotePinExistsRef.current = false;
           setPublicAccess(true);
           localStorage.removeItem('soccer_tournament_name');
           localStorage.removeItem('soccer_clubs');
@@ -959,6 +1128,19 @@ Jawablah secara ramah, informatif, dan cerdas seputar skenario poin, analisa tim
           </div>
 
           <div className="max-w-7xl mx-auto pt-4 md:pt-6">
+            <div className="flex justify-center mb-4">
+              <div className={`text-[11px] font-bold px-3 py-1.5 rounded-full border ${
+                firebaseStatus === 'online' ? 'bg-emerald-950/70 text-emerald-400 border-emerald-700/50' :
+                firebaseStatus === 'connecting' ? 'bg-amber-950/70 text-amber-400 border-amber-700/50' :
+                firebaseStatus === 'error' ? 'bg-red-950/70 text-red-400 border-red-700/50' :
+                'bg-slate-800 text-slate-400 border-slate-700'
+              }`}>
+                {firebaseStatus === 'online' ? '🟢 REAL-TIME AKTIF' :
+                 firebaseStatus === 'connecting' ? '🟡 Menghubungkan Firebase...' :
+                 firebaseStatus === 'error' ? '🔴 Firebase bermasalah' : '⚪ Mode lokal'}
+              </div>
+            </div>
+            
             <header className="mb-8 text-center">
               {posterUrl && (
                 <div className="mb-6 max-w-4xl mx-auto overflow-hidden rounded-2xl shadow-2xl border border-purple-500/30">
